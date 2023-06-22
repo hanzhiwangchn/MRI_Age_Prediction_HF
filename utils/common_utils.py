@@ -6,78 +6,73 @@ import torch
 import torchio as tio
 import pandas as pd
 
+from datasets import Dataset
+
 logger = logging.getLogger(__name__)
 
 
-def medical_augmentation(images):
-    training_transform = tio.Compose([
-        # tio.RandomBlur(p=0.5),  # blur 50% of times
-        # tio.RandomNoise(p=0.5),  # Gaussian noise 50% of times
-        tio.RandomFlip(flip_probability=0.5),
-    ])
-    return training_transform(images)
-
-
 class TrainDataset(torch.utils.data.Dataset):
-    """build training data-set"""
-    def __init__(self, images, labels, transform=None, medical_transform=None):
-        self.images = images
-        self.labels = labels
-        self.transform = transform
-        self.medical_transform = medical_transform
+    """
+    build training dataset
+    Note that Huggingface requires that __getitem__ method returns dict object
+    """
+    def __init__(self, images, labels):
+        self.dict = []
+        for i in range(len(images)):
+            temp_dict = {'image': images[i], 'label': labels[i]}
+            self.dict.append(temp_dict)
 
     def __len__(self):
-        return len(self.images)
+        return len(self.dict)
 
     def __getitem__(self, idx):
-        image, label = self.images[idx], self.labels[idx]
-        if self.transform:
-            image, label = self.transform([image, label])
-        if self.medical_transform:
-            # medical transformation can only be used in 3D medical images
-            image = self.medical_transform(image)
-        return image, label
+        return self.dict[idx]
 
 
 class ValidationDataset(torch.utils.data.Dataset):
-    """build validation data-set"""
-    def __init__(self, images, labels, transform=None):
-        self.images = images
-        self.labels = labels
-        self.transform = transform
+    """
+    build validation dataset
+    Note that Huggingface requires that __getitem__ method returns dict object
+    """
+    def __init__(self, images, labels):
+        self.dict = []
+        for i in range(len(images)):
+            temp_dict = {'image': images[i], 'label': labels[i]}
+            self.dict.append(temp_dict)
 
     def __len__(self):
-        return len(self.images)
+        return len(self.dict)
 
     def __getitem__(self, idx):
-        image, label = self.images[idx], self.labels[idx]
-        if self.transform:
-            image, label = self.transform([image, label])
-        return image, label
+        return self.dict[idx]
 
 
 class TestDataset(torch.utils.data.Dataset):
-    """build test data-set"""
-    def __init__(self, images, labels, transform=None):
-        self.images = images
-        self.labels = labels
-        self.transform = transform
+    """
+    build test dataset
+    Note that Huggingface requires that __getitem__ method returns dict object
+    """
+    def __init__(self, images, labels):
+        self.dict = []
+        for i in range(len(images)):
+            temp_dict = {'image': images[i], 'label': labels[i]}
+            self.dict.append(temp_dict)
 
     def __len__(self):
-        return len(self.images)
+        return len(self.dict)
 
     def __getitem__(self, idx):
-        image, label = self.images[idx], self.labels[idx]
-        if self.transform:
-            image, label = self.transform([image, label])
-        return image, label
+        return self.dict[idx]
 
 
-class ToTensor_MRI(object):
-    """Convert ndarrays in sample to Tensors for MRI"""
-    def __call__(self, sample):
-        image, label = sample[0], sample[1]
-        return torch.from_numpy(image), torch.from_numpy(label)
+def transform_to_huggingface_dataset(pt_dataset):
+    huggingface_dataset = Dataset.from_generator(gen, gen_kwargs={"pt_dataset": pt_dataset})
+    return huggingface_dataset
+
+
+def gen(pt_dataset):
+    for idx in range(len(pt_dataset)):
+        yield pt_dataset[idx]
 
 
 class RunManager:

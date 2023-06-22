@@ -9,10 +9,12 @@ import pandas as pd
 
 import torch
 import torch.nn as nn
-from torchvision import transforms
 
-from utils.model_configuration import ResNet, VGG, Inception, ResNet_stride, VGG_stride, Inception_stride
-from utils.common_utils import TrainDataset, ValidationDataset, TestDataset, ToTensor_MRI, medical_augmentation
+import torchio as tio
+
+from utils.model_configuration import ResNet, ResNet_stride
+from utils.common_utils import TrainDataset, ValidationDataset, TestDataset, \
+    transform_to_huggingface_dataset
 from utils.metrics_utils import svr, calculate_correlation_coefficient, \
     SkewedLossFunction_Ordinary
 
@@ -27,33 +29,12 @@ def update_args(args):
     :return: updated args
     """
     if args.dataset == 'camcan':
-        args.data_dir = '../camcan/mri_concat.pickle'
+        args.data_dir = '../../mri_concat.pickle'
         args.epochs = 400
         args.train_batch_size = 32
         args.update_lambda_start_epoch = 150
         args.update_lambda_second_phase_start_epoch = 250
         args.save_best_start_epoch = 100
-    elif args.dataset == 'camcan_skewed':
-        args.data_dir = '../camcan/camcan_skewed.pickle'
-        args.epochs = 400
-        args.train_batch_size = 32
-        args.update_lambda_start_epoch = 150
-        args.update_lambda_second_phase_start_epoch = 250
-        args.save_best_start_epoch = 100
-    elif args.dataset == 'abide':
-        args.data_dir = '../abide/'
-        args.epochs = 300
-        args.train_batch_size = 16
-        args.update_lambda_start_epoch = 75
-        args.update_lambda_second_phase_start_epoch = 175
-        args.save_best_start_epoch = 50
-    elif args.dataset == 'abide_symmetric':
-        args.data_dir = '../abide/'
-        args.epochs = 300
-        args.train_batch_size = 16
-        args.update_lambda_start_epoch = 75
-        args.update_lambda_second_phase_start_epoch = 175
-        args.save_best_start_epoch = 50
     return args
 
 
@@ -65,13 +46,34 @@ def build_dataset(args):
     """
     if args.dataset == 'camcan':
         dataset_train, dataset_validation, dataset_test, lim, input_shape, median_age = build_dataset_camcan(args)
-    elif args.dataset == 'camcan_skewed':
-        dataset_train, dataset_validation, dataset_test, lim, input_shape, median_age = build_dataset_camcan(args)
-    elif args.dataset == 'abide_symmetric':
-        dataset_train, dataset_validation, dataset_test, lim, input_shape, median_age = build_dataset_abide(args)
-    elif args.dataset == 'abide':
-        dataset_train, dataset_validation, dataset_test, lim, input_shape, median_age = build_dataset_abide(args)
     return dataset_train, dataset_validation, dataset_test, lim, input_shape, median_age
+
+
+def medical_augmentation():
+    training_transform = tio.Compose([
+        tio.RandomBlur(p=0.5),  # blur 50% of times
+        tio.RandomNoise(p=0.5),  # Gaussian noise 50% of times
+        tio.RandomFlip(flip_probability=0.5),
+        tio.ZNormalization()
+    ])
+
+    validation_transform = tio.Compose([
+        tio.ZNormalization()
+    ])
+
+    return training_transform, validation_transform
+
+
+def preprocess_train(example_batch):
+    """Apply train_transforms across a batch."""
+    example_batch["pixel_values"] = [train_transforms(torch.tensor(image)) for image in example_batch["image"]]
+    return example_batch
+
+
+def preprocess_validation(example_batch):
+    """Apply train_transforms across a batch."""
+    example_batch["pixel_values"] = [validation_transforms(torch.tensor(image)) for image in example_batch["image"]]
+    return example_batch
 
 
 def build_dataset_camcan(args):
@@ -133,104 +135,25 @@ def build_dataset_camcan(args):
                 f'testing images shape: {test_images.shape}, training labels shape: {train_labels.shape}, '
                 f'validation labels shape: {validation_labels.shape}, testing labels shape: {test_labels.shape}')
 
-    # Pytorch Data-set for train set. Apply data augmentation if needed using "torchio"
-    if args.data_aug:
-        dataset_train = TrainDataset(images=train_images, labels=train_labels,
-                                     transform=transforms.Compose([ToTensor_MRI()]),
-                                     medical_transform=medical_augmentation)
-    else:
-        dataset_train = TrainDataset(images=train_images, labels=train_labels,
-                                     transform=transforms.Compose([ToTensor_MRI()]))
-    # Pytorch Data-set for validation set
-    dataset_validation = ValidationDataset(images=validation_images, labels=validation_labels,
-                                           transform=transforms.Compose([ToTensor_MRI()]))
-    # Pytorch Data-set for test set
-    dataset_test = TestDataset(images=test_images, labels=test_labels,
-                               transform=transforms.Compose([ToTensor_MRI()]))
+    # Huggingface Data-set for train set.
+    dataset_train = TrainDataset(images=train_images, labels=train_labels)
+    dataset_train = transform_to_huggingface_dataset(pt_dataset=dataset_train).\
+        set_format(type='torch', columns=['image', 'label'])
+    # Huggingface Data-set for validation set
+    dataset_validation = ValidationDataset(images=validation_images, labels=validation_labels)
+    dataset_validation = transform_to_huggingface_dataset(pt_dataset=dataset_validation)\
+        .set_format(type='torch', columns=['image', 'label'])
+    # Huggingface Data-set for test set
+    dataset_test = TestDataset(images=test_images, labels=test_labels)
+    dataset_test = transform_to_huggingface_dataset(pt_dataset=dataset_test)\
+        .set_format(type='torch', columns=['image', 'label'])
 
-    return dataset_train, dataset_validation, dataset_test, lim, train_images.shape[1:], median_age
-
-
-def build_dataset_abide(args):
-    """
-    load ABIDE MRI data
-    http://preprocessed-connectomes-project.org/abide/download.html
-    """
-    # load MRI data(in .npy format)
-    if args.dataset == 'abide_symmetric':
-        images = np.load(args.data_dir + 'symmetric_images.npy')
-        age = np.load(args.data_dir + 'symmetric_age.npy')
-    elif args.dataset == 'abide':
-        images = np.load(args.data_dir + 'total_images.npy')
-        age = np.load(args.data_dir + 'total_age.npy')
-
-    df = pd.DataFrame()
-    df['Age'] = age
-    # retrieve the minimum, maximum and median age for skewed loss
-    lim = (df['Age'].min(), df['Age'].max())
-    median_age = df['Age'].median()
-
-    # add color channel dimension (bs, H, D, W) -> (bs, 1, H, D, W)
-    images = np.expand_dims(images, axis=1)
-
-    assert len(images.shape) == 5, images.shape
-    assert images.shape[1] == 1
-    assert len(images) == len(df)
-
-    # assign a categorical label to Age for Stratified Split
-    df['Age_categorical'] = pd.qcut(df['Age'], 25, labels=[i for i in range(25)])
-
-    # Stratified train validation-test Split
-    split = StratifiedShuffleSplit(test_size=args.val_test_size, random_state=args.random_state)
-    train_index, validation_test_index = next(split.split(df, df['Age_categorical']))
-    stratified_validation_test_set = df.loc[validation_test_index]
-    assert sorted(train_index.tolist() + validation_test_index.tolist()) == list(range(len(df)))
-
-    # Stratified validation test Split
-    split2 = StratifiedShuffleSplit(test_size=args.test_size, random_state=args.random_state)
-    validation_index, test_index = next(split2.split(stratified_validation_test_set,
-                                                     stratified_validation_test_set['Age_categorical']))
-
-    # NOTE: StratifiedShuffleSplit returns RangeIndex instead of the Original Index of the new DataFrame
-    assert sorted(validation_index.tolist() + test_index.tolist()) == \
-        list(range(len(stratified_validation_test_set.index)))
-    assert sorted(validation_index.tolist() + test_index.tolist()) != \
-        sorted(list(stratified_validation_test_set.index))
-
-    # get the correct index of the original DataFrame for validation/test set
-    validation_index = validation_test_index[validation_index]
-    test_index = validation_test_index[test_index]
-
-    # ensure there is no duplicated index in 3 data-sets
-    assert sorted(train_index.tolist() + validation_index.tolist() + test_index.tolist()) == list(range(len(df)))
-
-    # get train/validation/test set
-    train_images = images[train_index].astype(np.float32)
-    validation_images = images[validation_index].astype(np.float32)
-    test_images = images[test_index].astype(np.float32)
-    # add dimension for labels: (32,) -> (32, 1)
-    train_labels = np.expand_dims(df.loc[train_index, 'Age'].values, axis=1).astype(np.float32)
-    validation_labels = np.expand_dims(df.loc[validation_index, 'Age'].values, axis=1).astype(np.float32)
-    test_labels = np.expand_dims(df.loc[test_index, 'Age'].values, axis=1).astype(np.float32)
-
-    logger.info(f'Training images shape: {train_images.shape}, validation images shape: {validation_images.shape}, '
-                f'testing images shape: {test_images.shape}, training labels shape: {train_labels.shape}, '
-                f'validation labels shape: {validation_labels.shape}, testing labels shape: {test_labels.shape}')
-
-    # Pytorch Data-set for train set. Apply data augmentation if needed using "torchio"
-    if args.data_aug:
-        dataset_train = TrainDataset(images=train_images, labels=train_labels,
-                                     transform=transforms.Compose([ToTensor_MRI()]),
-                                     medical_transform=medical_augmentation)
-    else:
-        dataset_train = TrainDataset(images=train_images, labels=train_labels,
-                                     transform=transforms.Compose([ToTensor_MRI()]))
-    # Pytorch Data-set for validation set
-    dataset_validation = ValidationDataset(images=validation_images, labels=validation_labels,
-                                           transform=transforms.Compose([ToTensor_MRI()]))
-    # Pytorch Data-set for test set
-    dataset_test = TestDataset(images=test_images, labels=test_labels,
-                               transform=transforms.Compose([ToTensor_MRI()]))
+    # data augmentation on the training images
+    global train_transforms, validation_transforms
+    train_transforms, validation_transforms = medical_augmentation()
+    dataset_train.set_transform(preprocess_train)
+    dataset_validation.set_transform(preprocess_validation)
+    dataset_test.set_transform(preprocess_validation)
 
     return dataset_train, dataset_validation, dataset_test, lim, train_images.shape[1:], median_age
 
@@ -264,14 +187,6 @@ def build_model(args, device, input_shape):
         net = ResNet_stride(input_size=input_shape).to(device)
     elif args.model == 'resnet':
         net = ResNet(input_size=input_shape).to(device)
-    elif args.model == 'inception_stride':
-        net = Inception_stride(input_size=input_shape).to(device)
-    elif args.model == 'inception':
-        net = Inception(input_size=input_shape).to(device)
-    elif args.model == 'vgg':
-        net = VGG(input_size=input_shape).to(device)
-    elif args.model == 'vgg_stride':
-        net = VGG_stride(input_size=input_shape).to(device)
 
     # parameter initialization
     def weights_init(m):
@@ -531,14 +446,6 @@ def evaluate_testset_performance(args, test_loader, device, model_config, result
         net_test = ResNet_stride(input_size=input_shape).to(device)
     elif args.model == 'resnet':
         net_test = ResNet(input_size=input_shape).to(device)
-    elif args.model == 'inception_stride':
-        net_test = Inception_stride(input_size=input_shape).to(device)
-    elif args.model == 'inception':
-        net_test= Inception(input_size=input_shape).to(device)
-    elif args.model == 'vgg':
-        net_test = VGG(input_size=input_shape).to(device)
-    elif args.model == 'vgg_stride':
-        net_test = VGG_stride(input_size=input_shape).to(device)
 
     net_test.load_state_dict(state_dict=torch.load(os.path.join(results_folder, f"{model_config}_Best_Model.pt")))
     net_test.eval()
@@ -575,14 +482,6 @@ def apply_two_stage_correction(args, validation_loader, device, model_config, re
         net_test = ResNet_stride(input_size=input_shape).to(device)
     elif args.model == 'resnet':
         net_test = ResNet(input_size=input_shape).to(device)
-    elif args.model == 'inception_stride':
-        net_test = Inception_stride(input_size=input_shape).to(device)
-    elif args.model == 'inception':
-        net_test= Inception(input_size=input_shape).to(device)
-    elif args.model == 'vgg':
-        net_test = VGG(input_size=input_shape).to(device)
-    elif args.model == 'vgg_stride':
-        net_test = VGG_stride(input_size=input_shape).to(device)
 
     # reload weights
     net_test.load_state_dict(state_dict=torch.load(os.path.join(results_folder, f"{model_config}_Best_Model.pt")))

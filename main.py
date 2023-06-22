@@ -60,7 +60,7 @@ def build_parser():
     # NOTE: In the manuscript, we add experiments for distribution shifts.
     #  The updated code is not included in this script for the sake of simplicity.
     parser.add_argument('--dataset', type=str, default='camcan',
-                        choices=['camcan', 'camcan_skewed', 'abide', 'abide_symmetric'],
+                        choices=['camcan'],
                         help='specify which data-set to use')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
     parser.add_argument('--random-state', type=int, default=1000,
@@ -74,8 +74,6 @@ def build_parser():
                         help='proportion of test set of the "validation & test" set')
     parser.add_argument('--init-lambda', type=float, default=1.0,
                         help='default lambda value for the skewed loss')
-    parser.add_argument('--data-aug', action='store_true', default=True,
-                        help='Data augmentation especially for MRIs using torchio')
     parser.add_argument('--validation-batch-size', type=int, default=1,
                         help='use 1 as default because of the loss calculation method in RunManager')
     parser.add_argument('--test-batch-size', type=int, default=1)
