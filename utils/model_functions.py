@@ -9,10 +9,9 @@ import pandas as pd
 
 import torch
 import torch.nn as nn
-
 import torchio as tio
 
-from utils.model_configuration import ResNet, ResNet_stride
+from utils.model_configuration import ResNetModelHF, ResNetModelWithHeadHF
 from utils.common_utils import TrainDataset, ValidationDataset, TestDataset, \
     transform_to_huggingface_dataset
 from utils.metrics_utils import svr, calculate_correlation_coefficient, \
@@ -65,14 +64,20 @@ def medical_augmentation():
 
 
 def preprocess_train(example_batch):
-    """Apply train_transforms across a batch."""
-    example_batch["pixel_values"] = [train_transforms(torch.tensor(image)) for image in example_batch["image"]]
+    """
+    Apply train_transforms across a batch.
+    Note that set_transform will replace the format defined by set_format and
+        will be applied on-the-fly (when it is called).
+    """
+    example_batch["image"] = [train_transforms(torch.tensor(image)) for image in example_batch["image"]]
+    example_batch["label"] = [torch.tensor(label) for label in example_batch["label"]]
     return example_batch
 
 
 def preprocess_validation(example_batch):
-    """Apply train_transforms across a batch."""
-    example_batch["pixel_values"] = [validation_transforms(torch.tensor(image)) for image in example_batch["image"]]
+    """Apply validation_transforms across a batch."""
+    example_batch["image"] = [validation_transforms(torch.tensor(image)) for image in example_batch["image"]]
+    example_batch["label"] = [torch.tensor(label) for label in example_batch["label"]]
     return example_batch
 
 
@@ -137,16 +142,16 @@ def build_dataset_camcan(args):
 
     # Huggingface Data-set for train set.
     dataset_train = TrainDataset(images=train_images, labels=train_labels)
-    dataset_train = transform_to_huggingface_dataset(pt_dataset=dataset_train).\
-        set_format(type='torch', columns=['image', 'label'])
+    dataset_train = transform_to_huggingface_dataset(pt_dataset=dataset_train)
+    dataset_train.set_format(type='torch', columns=['image', 'label'])
     # Huggingface Data-set for validation set
     dataset_validation = ValidationDataset(images=validation_images, labels=validation_labels)
-    dataset_validation = transform_to_huggingface_dataset(pt_dataset=dataset_validation)\
-        .set_format(type='torch', columns=['image', 'label'])
+    dataset_validation = transform_to_huggingface_dataset(pt_dataset=dataset_validation)
+    dataset_validation.set_format(type='torch', columns=['image', 'label'])
     # Huggingface Data-set for test set
     dataset_test = TestDataset(images=test_images, labels=test_labels)
-    dataset_test = transform_to_huggingface_dataset(pt_dataset=dataset_test)\
-        .set_format(type='torch', columns=['image', 'label'])
+    dataset_test = transform_to_huggingface_dataset(pt_dataset=dataset_test)
+    dataset_test.set_format(type='torch', columns=['image', 'label'])
 
     # data augmentation on the training images
     global train_transforms, validation_transforms
@@ -183,10 +188,10 @@ def build_model(args, device, input_shape):
     In general, *_stride represents the models using stride=2.
     We implement *_stride architecture to increase the training speed for ABIDE data-sets
     """
-    if args.model == 'resnet_stride':
-        net = ResNet_stride(input_size=input_shape).to(device)
-    elif args.model == 'resnet':
-        net = ResNet(input_size=input_shape).to(device)
+    if args.model == 'hf_resnet':
+        net = ResNetModelHF().to(device)
+    elif args.model == 'hf_resnet_with_head':
+        net = ResNetModelWithHeadHF().to(device)
 
     # parameter initialization
     def weights_init(m):

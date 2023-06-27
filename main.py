@@ -31,9 +31,8 @@ def build_parser():
     For two-stage correction, python main.py --two-stage-correction --comment run1
     """
     parser = argparse.ArgumentParser(description='Brain MRI Age Prediction')
-    parser.add_argument('--model', type=str, default='resnet',
-                        choices=['resnet', 'vgg', 'inception',
-                                 'resnet_stride',  'vgg_stride', 'inception_stride'],
+    parser.add_argument('--model', type=str, default='hf_resnet',
+                        choices=['hf_resnet', 'hf_resnet_with_head'],
                         help='model configurations')
     parser.add_argument('--loss-type', type=str, default='L1', choices=['L1', 'L2', 'SVR'],
                         help='normal loss function configurations')
