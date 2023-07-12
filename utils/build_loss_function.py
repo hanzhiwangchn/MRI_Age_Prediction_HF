@@ -1,44 +1,43 @@
-import torch
+import logging, torch
+
 import torch.nn as nn
-from scipy import stats
+
+logger = logging.getLogger(__name__)
+results_folder = 'model_ckpt_results'
 
 
-def calculate_correlation_coefficient(preds, labels, args):
-    """
-    calculate correlation coefficient
-    """
-    if args.correlation_type == 'pearson':
-        error = preds - labels
-        vx = error - torch.mean(error)
-        vy = labels - torch.mean(labels)
-        corr_coef = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))
-    elif args.correlation_type == 'spearman':
-        error = preds - labels
-        corr_coef = stats.spearmanr(error.cpu(), labels.cpu())[0]
-    return corr_coef
+def build_loss_function(args):
+    """build loss functions"""
+    # NOTE: no matter what kind of tricks we use in training,
+    #  we should always focus the MAE on the test-set.
+    loss_fn_val = nn.L1Loss()
+    loss_fn_test = nn.L1Loss()
 
-
-def svr(y_pred, y_true, epsilon=1):
-    """
-    epsilon-insensitive loss. It works in the same way as nn.L1Loss() or nn.MSELoss()
-    """
-    if y_true.is_cuda:
-        device = 'cuda'
+    # select training loss function
+    if args.skewed_loss:
+        logger.info(f'Current lambda is {args.init_lambda}')
+        loss_fn_train = SkewedLossFunction_Ordinary(args=args).to(args.device)
     else:
-        device = 'cpu'
-    return torch.mean(torch.max(torch.abs(y_pred - y_true) - epsilon,
-                                torch.tensor([0. for _ in range(len(y_pred))]).to(device).view(-1, 1)))
+        logger.info('Use normal loss')
+        if args.loss_type == 'L1':
+            loss_fn_train = nn.L1Loss()
+        elif args.loss_type == 'L2':
+            loss_fn_train = nn.MSELoss()
+        elif args.loss_type == 'SVR':
+            # no bracket after svr, pls see its implementation
+            loss_fn_train = svr
+    return loss_fn_train, loss_fn_val, loss_fn_test
 
 
 class SkewedLossFunction_Ordinary(nn.Module):
     """
     Ordinary skewed loss function implementation.
     """
-    def __init__(self, args, lim, median_age):
+    def __init__(self, args):
         super(SkewedLossFunction_Ordinary, self).__init__()
         self.lamda_max = args.init_lambda
-        self.lim = lim
-        self.median_age = median_age
+        self.lim = args.age_limits
+        self.median_age = args.median_age
         self.loss_type = args.loss_type
 
     def forward(self, y_pred, y_true):
@@ -138,11 +137,11 @@ class SkewedLossFunction_Ordinary(nn.Module):
 
 class SkewedLossFunction_OneSide(nn.Module):
     """one-side skewed loss function implementation"""
-    def __init__(self, args, lim, median_age):
+    def __init__(self, args):
         super(SkewedLossFunction_OneSide, self).__init__()
         self.lamda_max = args.init_lambda
-        self.lim = lim
-        self.median_age = median_age
+        self.lim = args.age_limits
+        self.median_age = args.median_age
         self.loss_type = args.loss_type
 
     def forward(self, y_pred, y_true):
@@ -242,3 +241,16 @@ class SkewedLossFunction_OneSide(nn.Module):
                                     torch.tensor([0. for _ in range(len(y_pred))]).to(device).view(-1, 1)) *
                           torch.abs(lamda(y_true)))
         return svr_skewed
+
+
+
+def svr(y_pred, y_true, epsilon=1):
+    """
+    epsilon-insensitive loss. It works in the same way as nn.L1Loss() or nn.MSELoss()
+    """
+    if y_true.is_cuda:
+        device = 'cuda'
+    else:
+        device = 'cpu'
+    return torch.mean(torch.max(torch.abs(y_pred - y_true) - epsilon,
+                                torch.tensor([0. for _ in range(len(y_pred))]).to(device).view(-1, 1)))

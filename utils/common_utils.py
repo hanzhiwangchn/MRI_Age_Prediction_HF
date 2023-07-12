@@ -1,16 +1,13 @@
 from collections import OrderedDict
-import time
-import logging
+import time, os, json ,logging, torch
 
-import torch
-import torchio as tio
+from scipy import stats
 import pandas as pd
 
-from datasets import Dataset
-
 logger = logging.getLogger(__name__)
+results_folder = 'model_ckpt_results'
 
-
+# ------------------- Pytorch Dataset ---------------------
 class TrainDataset(torch.utils.data.Dataset):
     """
     build training dataset
@@ -65,48 +62,46 @@ class TestDataset(torch.utils.data.Dataset):
         return self.dict[idx]
 
 
-def transform_to_huggingface_dataset(pt_dataset):
-    huggingface_dataset = Dataset.from_generator(gen, gen_kwargs={"pt_dataset": pt_dataset})
-    return huggingface_dataset
-
-
-def gen(pt_dataset):
-    for idx in range(len(pt_dataset)):
-        yield pt_dataset[idx]
-
-
+# ------------------- Run Manager for no Trainer training ---------------------
 class RunManager:
     """capture model stats"""
-    def __init__(self):
+    def __init__(self, args):
         self.epoch_num_count = 0
         self.epoch_start_time = None
+        self.args = args
 
         # train/validation/test metrics
         self.train_epoch_loss = 0
-        self.train_epoch_standard_loss = 0
-        self.validation_epoch_loss = 0
-        self.test_epoch_loss = 0
+
         self.run_correlation_train = []
-        self.run_correlation_validation = []
+        self.run_correlation_val = []
         self.run_correlation_test = []
+
+        self.run_metrics_train = None
+        self.run_metrics_val = None
+        self.run_metrics_test = None
 
         # run data saves the stats from train/validation/test set
         self.run_data = []
         self.run_start_time = None
 
-        self.train_data_loader = None
-        self.validation_data_loader = None
-        self.test_data_loader = None
+        self.train_loader = None
+        self.val_loader = None
+        self.test_loader = None
         self.epoch_stats = None
 
-    def begin_run(self, train_data_loader, validation_data_loader, test_data_loader):
+    def begin_run(self, train_loader, val_loader, test_loader):
         self.run_start_time = time.time()
-        self.train_data_loader = train_data_loader
-        self.validation_data_loader = validation_data_loader
-        self.test_data_loader = test_data_loader
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
         logger.info('Begin Run!')
 
-    def end_run(self):
+    def end_run(self, dirs):
+        """save metrics from test set"""
+        test_results = {f"eval_{k}": v for k, v in self.run_metrics_test.items()}
+        with open(os.path.join(dirs, "test_results.json"), "w") as f:
+            json.dump(test_results, f)
         self.epoch_num_count = 0
         logger.info('End Run!')
 
@@ -115,30 +110,23 @@ class RunManager:
         self.epoch_start_time = time.time()
         # initialize metrics
         self.train_epoch_loss = 0
-        self.train_epoch_standard_loss = 0
-        self.validation_epoch_loss = 0
-        self.test_epoch_loss = 0
         logger.info(f'Start epoch {self.epoch_num_count}')
 
     def end_epoch(self):
         epoch_duration = time.time() - self.epoch_start_time
         run_duration = time.time() - self.run_start_time
-        # calculate metrics
-        train_loss = self.train_epoch_loss / len(self.train_data_loader.dataset)
-        train_standard_loss = self.train_epoch_standard_loss / len(self.train_data_loader.dataset)
-        validation_loss = self.validation_epoch_loss / len(self.validation_data_loader.dataset)
-        test_loss = self.test_epoch_loss / len(self.test_data_loader.dataset)
+        # calculate loss
+        train_loss = self.train_epoch_loss / len(self.train_loader.dataset)
         logger.info(f'End epoch {self.epoch_num_count}')
 
         # add stats from current epoch to run data
         self.epoch_stats = OrderedDict()
         self.epoch_stats['epoch'] = self.epoch_num_count
         self.epoch_stats['train_loss'] = float(f'{train_loss:.2f}')
-        self.epoch_stats['train_standard_loss'] = float(f'{train_standard_loss:.2f}')
-        self.epoch_stats['validation_loss'] = float(f'{validation_loss:.2f}')
-        self.epoch_stats['test_loss'] = float(f'{test_loss:.2f}')
+        self.epoch_stats.update(self.run_metrics_train)
+        self.epoch_stats.update(self.run_metrics_val)
         self.epoch_stats['train_correlation'] = float(f'{self.run_correlation_train[-1]:.2f}')
-        self.epoch_stats['validation_correlation'] = float(f'{self.run_correlation_validation[-1]:.2f}')
+        self.epoch_stats['val_correlation'] = float(f'{self.run_correlation_val[-1]:.2f}')
         self.epoch_stats['test_correlation'] = float(f'{self.run_correlation_test[-1]:.2f}')
         self.epoch_stats['epoch_duration'] = float(f'{epoch_duration:.1f}')
         self.epoch_stats['run_duration'] = float(f'{run_duration:.1f}')
@@ -146,19 +134,16 @@ class RunManager:
 
     def track_train_loss(self, loss):
         # accumulate training loss for all batches
-        self.train_epoch_loss += loss.item() * self.train_data_loader.batch_size
+        self.train_epoch_loss += loss.item() * self.train_loader.batch_size
 
-    def track_standard_train_loss(self, loss):
-        # accumulate training loss for all batches(standard loss)
-        self.train_epoch_standard_loss += loss.item() * self.train_data_loader.batch_size
+    def collect_train_metrics(self, metric_results):
+        self.run_metrics_train = {f'train_{k}': round(v, 3) for k, v in metric_results.items()}
 
-    def track_validation_loss(self, loss):
-        # accumulate validation loss for all batches
-        self.validation_epoch_loss += loss.item() * self.validation_data_loader.batch_size
-
-    def track_test_loss(self, loss):
-        # accumulate test loss for all batches
-        self.test_epoch_loss += loss.item() * self.test_data_loader.batch_size
+    def collect_val_metrics(self, metric_results):
+        self.run_metrics_val = {f'val_{k}': round(v, 3) for k, v in metric_results.items()}
+        
+    def collect_test_metrics(self, metric_results):
+        self.run_metrics_test = {f'test_{k}': round(v, 3) for k, v in metric_results.items()}
 
     def collect_train_correlation(self, correlation):
         self.run_correlation_train.append(correlation)
@@ -175,3 +160,124 @@ class RunManager:
 
     def save(self, filename):
         pd.DataFrame.from_dict(self.run_data, orient='columns').to_csv(f'{filename}.csv')
+
+
+# ------------------- model functions ---------------------
+def update_args(args):
+    """update arguments"""
+    # use CUDA if possible
+    args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.info(f'Found device: {args.device}')
+
+    args.out_dir = results_folder
+    args.model_name_no_trainer = args.model+ f'-pt-{args.comment}' 
+    args.out_dir_no_trainer = f'{args.out_dir}/{args.model_name_no_trainer}'
+
+    if args.dataset == 'camcan':
+        args.data_dir = '../../mri_concat.pickle'
+        args.num_train_epochs = 400
+        args.batch_size = 32
+        args.update_lambda_start_epoch = 150
+        args.update_lambda_second_phase_start_epoch = 250
+        args.save_best_start_epoch = 100
+
+    if args.run_code_test:
+        args.num_train_epochs = 20
+        args.batch_size = 64
+        args.update_lambda_start_epoch = 3
+        args.update_lambda_second_phase_start_epoch = 5
+        args.save_best_start_epoch = 10
+    return args
+
+
+def calculate_correlation(args, model, m, train_loader, val_loader, test_loader):
+    """calculate correlation after current epoch"""
+    train_preds_list = []
+    train_labels_list = []
+    val_preds_list = []
+    val_labels_list = []
+    test_preds_list = []
+    test_labels_list = []
+
+    model.eval()
+    # training set
+    with torch.no_grad():
+        for batch in train_loader:
+            batch = {k: v.to(args.device) for k, v in batch.items()}
+            outputs = model(batch['pixel_values'])
+
+            assert outputs.shape == batch['labels'].shape
+            assert len(outputs.shape) == 2
+
+
+            train_preds_list.append(outputs)
+            train_labels_list.append(batch['labels'])
+
+        # preds and labels will have shape (*, 1)
+        preds = torch.cat(train_preds_list, 0)
+        labels = torch.cat(train_labels_list, 0)
+        assert preds.shape == labels.shape
+        assert preds.shape[1] == 1
+
+        correlation = calculate_correlation_coefficient(preds=preds, labels=labels, args=args)
+        # track train correlation
+        m.collect_train_correlation(correlation=correlation.item())
+
+    # validation set
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = {k: v.to(args.device) for k, v in batch.items()}
+            outputs = model(batch['pixel_values'])
+
+            assert outputs.shape == batch['labels'].shape
+            assert len(outputs.shape) == 2
+
+            val_preds_list.append(outputs)
+            val_labels_list.append(batch['labels'])
+
+        # preds and labels will have shape (*, 1)
+        preds = torch.cat(val_preds_list, 0)
+        labels = torch.cat(val_labels_list, 0)
+        assert preds.shape == labels.shape
+        assert preds.shape[1] == 1
+
+        correlation = calculate_correlation_coefficient(preds=preds, labels=labels, args=args)
+        # track train correlation
+        m.collect_val_correlation(correlation=correlation.item())
+
+    # test set
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = {k: v.to(args.device) for k, v in batch.items()}
+            outputs = model(batch['pixel_values'])
+
+            assert outputs.shape == batch['labels'].shape
+            assert len(outputs.shape) == 2
+
+            test_preds_list.append(outputs)
+            test_labels_list.append(batch['labels'])
+
+        # preds and labels will have shape (*, 1)
+        preds = torch.cat(train_preds_list, 0)
+        labels = torch.cat(train_labels_list, 0)
+        assert preds.shape == labels.shape
+        assert preds.shape[1] == 1
+
+        correlation = calculate_correlation_coefficient(preds=preds, labels=labels, args=args)
+        # track test correlation
+        m.collect_test_correlation(correlation=correlation.item())
+
+
+def calculate_correlation_coefficient(preds, labels, args):
+    """
+    calculate correlation coefficient
+    """
+    if args.correlation_type == 'pearson':
+        error = preds - labels
+        vx = error - torch.mean(error)
+        vy = labels - torch.mean(labels)
+        corr_coef = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))
+    elif args.correlation_type == 'spearman':
+        error = preds - labels
+        corr_coef = stats.spearmanr(error.cpu(), labels.cpu())[0]
+    return corr_coef
