@@ -7,13 +7,23 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 results_folder = 'model_ckpt_results'
 
+
+class ToTensor_MRI(object):
+    """Convert ndarrays in sample to Tensors for MRI"""
+    def __call__(self, sample):
+        image, label = sample[0], sample[1]
+        return torch.from_numpy(image), torch.from_numpy(label)
+
+
 # ------------------- Pytorch Dataset ---------------------
 class TrainDataset(torch.utils.data.Dataset):
     """
     build training dataset
     Note that Huggingface requires that __getitem__ method returns dict object
     """
-    def __init__(self, images, labels):
+    def __init__(self, images, labels, transform=None, medical_augment=None):
+        self.transform = transform
+        self.medical_augment = medical_augment
         self.dict = []
         for i in range(len(images)):
             temp_dict = {'image': images[i], 'label': labels[i]}
@@ -23,7 +33,13 @@ class TrainDataset(torch.utils.data.Dataset):
         return len(self.dict)
 
     def __getitem__(self, idx):
-        return self.dict[idx]
+        image, label = self.dict[idx]['image'], self.dict[idx]['label']
+        if self.transform:
+            image, label = self.transform([image, label])
+        if self.medical_augment:
+            # medical augmentation can only be used on 3D medical images
+            image = self.medical_augment(image)
+        return {'image': image, 'label': label}
 
 
 class ValidationDataset(torch.utils.data.Dataset):
@@ -31,7 +47,8 @@ class ValidationDataset(torch.utils.data.Dataset):
     build validation dataset
     Note that Huggingface requires that __getitem__ method returns dict object
     """
-    def __init__(self, images, labels):
+    def __init__(self, images, labels, transform=None):
+        self.transform = transform
         self.dict = []
         for i in range(len(images)):
             temp_dict = {'image': images[i], 'label': labels[i]}
@@ -41,7 +58,10 @@ class ValidationDataset(torch.utils.data.Dataset):
         return len(self.dict)
 
     def __getitem__(self, idx):
-        return self.dict[idx]
+        image, label = self.dict[idx]['image'], self.dict[idx]['label']
+        if self.transform:
+            image, label = self.transform([image, label])
+        return {'image': image, 'label': label}
 
 
 class TestDataset(torch.utils.data.Dataset):
@@ -49,7 +69,8 @@ class TestDataset(torch.utils.data.Dataset):
     build test dataset
     Note that Huggingface requires that __getitem__ method returns dict object
     """
-    def __init__(self, images, labels):
+    def __init__(self, images, labels, transform=None):
+        self.transform = transform
         self.dict = []
         for i in range(len(images)):
             temp_dict = {'image': images[i], 'label': labels[i]}
@@ -59,7 +80,10 @@ class TestDataset(torch.utils.data.Dataset):
         return len(self.dict)
 
     def __getitem__(self, idx):
-        return self.dict[idx]
+        image, label = self.dict[idx]['image'], self.dict[idx]['label']
+        if self.transform:
+            image, label = self.transform([image, label])
+        return {'image': image, 'label': label}
 
 
 # ------------------- Run Manager for no Trainer training ---------------------
@@ -148,8 +172,8 @@ class RunManager:
     def collect_train_correlation(self, correlation):
         self.run_correlation_train.append(correlation)
 
-    def collect_validation_correlation(self, correlation):
-        self.run_correlation_validation.append(correlation)
+    def collect_val_correlation(self, correlation):
+        self.run_correlation_val.append(correlation)
 
     def collect_test_correlation(self, correlation):
         self.run_correlation_test.append(correlation)
@@ -169,24 +193,33 @@ def update_args(args):
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.info(f'Found device: {args.device}')
 
-    args.out_dir = results_folder
-    args.model_name_no_trainer = args.model+ f'-pt-{args.comment}' 
-    args.out_dir_no_trainer = f'{args.out_dir}/{args.model_name_no_trainer}'
-
+    # original setting for camcan dataset
     if args.dataset == 'camcan':
-        args.data_dir = '../../mri_concat.pickle'
+        args.data_dir = '../shared/camcan/mri_concat.pickle'
         args.num_train_epochs = 400
         args.batch_size = 32
         args.update_lambda_start_epoch = 150
         args.update_lambda_second_phase_start_epoch = 250
         args.save_best_start_epoch = 100
 
+    # quick pipeline check setting
     if args.run_code_test:
-        args.num_train_epochs = 20
-        args.batch_size = 64
-        args.update_lambda_start_epoch = 3
-        args.update_lambda_second_phase_start_epoch = 5
-        args.save_best_start_epoch = 10
+        # training
+        args.model = 'resnet'
+        args.num_train_epochs = 10
+        args.batch_size = 32
+        args.update_lambda_start_epoch = 2
+        args.update_lambda_second_phase_start_epoch = 4
+        args.save_best_start_epoch = 1
+        args.comment = 'test_run'
+        # dataset
+        # args.val_test_size = 0.8
+        # args.test_size = 0.5
+
+    args.out_dir = results_folder
+    args.model_name_no_trainer = args.model+ f'-pt-{args.comment}' 
+    args.out_dir_no_trainer = f'{args.out_dir}/{args.model_name_no_trainer}'
+    os.makedirs(args.out_dir_no_trainer, exist_ok=True)
     return args
 
 
@@ -204,14 +237,13 @@ def calculate_correlation(args, model, m, train_loader, val_loader, test_loader)
     with torch.no_grad():
         for batch in train_loader:
             batch = {k: v.to(args.device) for k, v in batch.items()}
-            outputs = model(batch['pixel_values'])
+            outputs = model(batch['image'])
 
-            assert outputs.shape == batch['labels'].shape
+            assert outputs.shape == batch['label'].shape
             assert len(outputs.shape) == 2
 
-
             train_preds_list.append(outputs)
-            train_labels_list.append(batch['labels'])
+            train_labels_list.append(batch['label'])
 
         # preds and labels will have shape (*, 1)
         preds = torch.cat(train_preds_list, 0)
@@ -227,13 +259,13 @@ def calculate_correlation(args, model, m, train_loader, val_loader, test_loader)
     with torch.no_grad():
         for batch in val_loader:
             batch = {k: v.to(args.device) for k, v in batch.items()}
-            outputs = model(batch['pixel_values'])
+            outputs = model(batch['image'])
 
-            assert outputs.shape == batch['labels'].shape
+            assert outputs.shape == batch['label'].shape
             assert len(outputs.shape) == 2
 
             val_preds_list.append(outputs)
-            val_labels_list.append(batch['labels'])
+            val_labels_list.append(batch['label'])
 
         # preds and labels will have shape (*, 1)
         preds = torch.cat(val_preds_list, 0)
@@ -249,13 +281,13 @@ def calculate_correlation(args, model, m, train_loader, val_loader, test_loader)
     with torch.no_grad():
         for batch in test_loader:
             batch = {k: v.to(args.device) for k, v in batch.items()}
-            outputs = model(batch['pixel_values'])
+            outputs = model(batch['image'])
 
-            assert outputs.shape == batch['labels'].shape
+            assert outputs.shape == batch['label'].shape
             assert len(outputs.shape) == 2
 
             test_preds_list.append(outputs)
-            test_labels_list.append(batch['labels'])
+            test_labels_list.append(batch['label'])
 
         # preds and labels will have shape (*, 1)
         preds = torch.cat(train_preds_list, 0)
@@ -269,9 +301,7 @@ def calculate_correlation(args, model, m, train_loader, val_loader, test_loader)
 
 
 def calculate_correlation_coefficient(preds, labels, args):
-    """
-    calculate correlation coefficient
-    """
+    """calculate correlation coefficient"""
     if args.correlation_type == 'pearson':
         error = preds - labels
         vx = error - torch.mean(error)

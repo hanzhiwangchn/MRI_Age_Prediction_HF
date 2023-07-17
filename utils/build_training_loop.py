@@ -1,6 +1,5 @@
-import torch, math, logging, os
+import torch, math, logging, os, time
 from transformers import get_scheduler
-from tqdm.auto import tqdm
 import evaluate
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -11,19 +10,13 @@ from utils.build_loss_function import build_loss_function
 logger = logging.getLogger(__name__)
 
 
-def collate_fn(examples):
-    """generate batches"""
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    labels = torch.tensor([example["label"] for example in examples])
-    return {"pixel_values": pixel_values, "labels": labels}
-
-
+# ------------------- build data loader ---------------------
 def build_loader(args, dataset_train, dataset_val, dataset_test):
-    """make data loader"""
+    """main function for dataloader building"""
     # build data-loader configurations
-    train_kwargs = {'batch_size': args.batch_size, 'shuffle': True, 'collate_fn': collate_fn}
-    validation_kwargs = {'batch_size': args.batch_size, 'shuffle': False, 'collate_fn': collate_fn}
-    test_kwargs = {'batch_size': args.batch_size, 'shuffle': False, 'collate_fn': collate_fn}
+    train_kwargs = {'batch_size': args.batch_size, 'shuffle': True}
+    validation_kwargs = {'batch_size': args.batch_size, 'shuffle': False}
+    test_kwargs = {'batch_size': args.batch_size, 'shuffle': False}
     if torch.cuda.is_available():
         cuda_kwargs = {'pin_memory': True}
         train_kwargs.update(cuda_kwargs)
@@ -38,8 +31,16 @@ def build_loader(args, dataset_train, dataset_val, dataset_test):
     return train_loader, val_loader, test_loader
 
 
+# def collate_fn(examples):
+#     """generate batches for data loader"""
+#     images = torch.stack([example["image"] for example in examples])
+#     labels = torch.tensor([example["label"] for example in examples]).reshape(-1, 1)
+#     return {"pixel_values": images, "labels": labels}
+
+
+# ------------------- build optimizer ---------------------
 def build_optimizer(model, train_loader, args):
-    """make optimizer and learning_rate scheduler"""
+    """build optimizer and learning-rate scheduler"""
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     num_update_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
@@ -53,26 +54,26 @@ def build_optimizer(model, train_loader, args):
     return optimizer, lr_scheduler
 
 
-def train_val_test_pt(args, train_loader, val_loader, test_loader, model, 
-    optimizer, lr_scheduler, m, loss_fn_train):
-    """train/val/test for pytorch loop."""
+# ------------------- build main training loop ---------------------
+def train_val_test_pt(args, train_loader, val_loader, test_loader, model, optimizer, 
+        lr_scheduler, m, loss_fn_train):
+    """train/val/test for pytorch loop"""
     model.to(args.device)
-    # get progress bar
+    # variables for compact dynamic lambda
+    lambda_correlation_list = []
+
     if not args.test:
-        progress_bar = tqdm(range(args.max_train_steps))
         best_loss = 100
 
         # train and evaluate
         # We move RunManager track loss to evaluate package using evaluate.load('mae')
         for epoch in range(args.num_train_epochs):
             m.begin_epoch()
-            train(args, model, m, train_loader, optimizer, lr_scheduler, progress_bar, loss_fn_train)
-            validation(args, model, m, val_loader)
-            m.end_epoch()
-            m.display_epoch_results()
+            train(args, model, m, train_loader, optimizer, lr_scheduler, loss_fn_train)
+            val(args, model, m, val_loader)
 
             # calculate correlation on train/validation/test set
-            calculate_correlation(args, model, m, train_loader, validation_loader, test_loader)
+            calculate_correlation(args, model, m, train_loader, val_loader, test_loader)
 
             # dynamic lambda algorithm
             if epoch in range(args.update_lambda_start_epoch, args.num_train_epochs+1, args.compact_update_interval) \
@@ -97,6 +98,9 @@ def train_val_test_pt(args, train_loader, val_loader, test_loader, model,
                         logger.info(f'Lower validation loss found at epoch {m.epoch_num_count}')
                         best_loss = m.epoch_stats['val_mae']
                         torch.save(model.state_dict(), os.path.join(args.out_dir_no_trainer, "Best_Model.pt"))
+            
+            m.end_epoch()
+            m.display_epoch_results()
     
     # testing
     # test(args, model, m, test_loader)
@@ -106,7 +110,7 @@ def train_val_test_pt(args, train_loader, val_loader, test_loader, model,
     m.save(os.path.join(args.out_dir_no_trainer, f'{args.model_name_no_trainer}_runtime_stats'))
 
 
-def train(args, model, m, train_loader, optimizer, lr_scheduler, progress_bar, loss_fn_train):
+def train(args, model, m, train_loader, optimizer, lr_scheduler, loss_fn_train):
     """training part"""
     all_metrics, all_metrics_results = dict(), dict()
     all_metric_type = ["mae"]
@@ -116,23 +120,21 @@ def train(args, model, m, train_loader, optimizer, lr_scheduler, progress_bar, l
     model.train()
     for batch in train_loader:
         batch = {k: v.to(args.device) for k, v in batch.items()}
+        outputs = model(batch['image'])
 
-        outputs = model(batch['pixel_values'])
-
-        assert outputs.shape == batch['labels'].shape
+        assert outputs.shape == batch['label'].shape
         assert len(outputs.shape) == 2
 
-        loss = loss_fn_train(outputs, batch['labels'])
+        loss = loss_fn_train(outputs, batch['label'])
         # calculate loss again using validation loss function. It is used to detect over-fitting
         for metric in all_metric_type:
-            all_metrics[metric].add_batch(predictions=outputs, references=batch["labels"])
+            all_metrics[metric].add_batch(predictions=outputs, references=batch["label"])
         # loss should be a tensor of a single value
         loss.backward()
 
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
-        progress_bar.update(1)
 
         # track train loss
         m.track_train_loss(loss=loss)
@@ -142,12 +144,12 @@ def train(args, model, m, train_loader, optimizer, lr_scheduler, progress_bar, l
             all_metrics_results.update(all_metrics[metric].compute(average='weighted'))
         else:
             all_metrics_results.update(all_metrics[metric].compute())
-    
+
     # track val metrics
     m.collect_train_metrics(metric_results=all_metrics_results)
 
 
-def validation(args, model, m, validation_loader):
+def val(args, model, m, val_loader):
     """validation part"""
     all_metrics, all_metrics_results = dict(), dict()
     all_metric_type = ["mae"]
@@ -156,16 +158,15 @@ def validation(args, model, m, validation_loader):
 
     model.eval()
     with torch.no_grad():
-        for batch in validation_loader:
+        for batch in val_loader:
             batch = {k: v.to(args.device) for k, v in batch.items()}
+            outputs = model(batch['image'])
 
-            outputs = model(batch['pixel_values'])
-
-            assert outputs.shape == batch['labels'].shape
+            assert outputs.shape == batch['label'].shape
             assert len(outputs.shape) == 2
 
             for metric in all_metric_type:
-                all_metrics[metric].add_batch(predictions=outputs, references=batch["labels"])
+                all_metrics[metric].add_batch(predictions=outputs, references=batch["label"])
 
     for metric in all_metric_type:
         if metric in ["recall", "precision", "f1"]:
@@ -184,24 +185,24 @@ def test(args, model, m, test_loader):
     for metric in all_metric_type:
         all_metrics[metric] = evaluate.load(metric)
 
-    if not args.test:
-        # temporarily change the argument, borrow build_model implementation to load models
-        args.test = True
-        model = build_model(args)
-        model.to(args.device)
-        args.test = False
+    # if not args.test:
+    #     # temporarily change the argument, borrow build_model implementation to load models
+    #     args.test = True
+    #     model = build_model(args)
+    #     model.to(args.device)
+    #     args.test = False
     
     model.eval()
     with torch.no_grad():
         for batch in test_loader:
             batch = {k: v.to(args.device) for k, v in batch.items()}
-            outputs = model(batch['pixel_values'])
+            outputs = model(batch['image'])
 
-            assert outputs.shape == batch['labels'].shape
+            assert outputs.shape == batch['label'].shape
             assert len(outputs.shape) == 2
 
             for metric in all_metric_type:
-                all_metrics[metric].add_batch(predictions=outputs, references=batch["labels"])
+                all_metrics[metric].add_batch(predictions=outputs, references=batch["label"])
 
     for metric in all_metric_type:
         if metric in ["recall", "precision", "f1"]:
@@ -224,10 +225,7 @@ def update_lamda_max(args, m, epoch, lambda_correlation_list):
     """update lambda value based on correlations"""
     # A moving average function is applied because correlation has wild oscillation.
     # We further select the median value to represent the trends of the correlation
-    if args.compact_target == 'train':
-        corr_median = np.median(moving_average(m.run_correlation_train[-1 * args.compact_update_interval:], n=3))
-    elif args.compact_target == 'validation':
-        corr_median = np.median(moving_average(m.run_correlation_validation[-1 * args.compact_update_interval:], n=3))
+    corr_median = np.median(moving_average(m.run_correlation_val[-1 * args.compact_update_interval:], n=3))
     logger.info(f'median averaged correlation is {corr_median}')
     temp_lambda_corr_pair = [args.init_lambda, corr_median]
 
@@ -255,9 +253,7 @@ def update_lamda_max(args, m, epoch, lambda_correlation_list):
 
 
 def find_optimal_lambda(lambda_correlation_list):
-    """
-    find the best lambda value to make correlation move towards zero using LR
-    """
+    """find the best lambda value to make correlation move towards zero using LR"""
     lambda_correlation_array = np.array(lambda_correlation_list)
     lambda_val = lambda_correlation_array[:, 0]
     correlation = lambda_correlation_array[:, 1]
@@ -288,4 +284,3 @@ def find_optimal_lambda(lambda_correlation_list):
     logger.info(f'slope of lr is {slope}; bias of lr is {bias}')
     logger.info(f'optimal lambda is {opt_lambda}')
     return opt_lambda
-

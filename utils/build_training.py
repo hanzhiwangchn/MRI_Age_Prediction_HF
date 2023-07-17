@@ -2,6 +2,7 @@ from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 import evaluate
 
 class CustomTrainer(Trainer):
+    """custom trainer based on original trainer"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

@@ -4,8 +4,11 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from datasets import Dataset
 import numpy as np
 import pandas as pd
+from torchvision import transforms
 
-from utils.common_utils import TrainDataset, ValidationDataset, TestDataset
+
+from utils.common_utils import TrainDataset, ValidationDataset, TestDataset, ToTensor_MRI
+from utils.build_processor import medical_augmentation_pt
 
 logger = logging.getLogger(__name__)
 results_folder = 'model_ckpt_results'
@@ -14,13 +17,13 @@ results_folder = 'model_ckpt_results'
 def build_dataset(args):
     """main function for dataset building"""
     if args.dataset == 'camcan':
-        dataset_train, dataset_validation, dataset_test, lim, input_shape, median_age = build_dataset_camcan(args)
+        dataset_train, dataset_val, dataset_test, lim, input_shape, median_age = build_dataset_camcan(args)
 
     # update arguments
     args.age_limits = lim
     args.input_shape = input_shape
     args.median_age = median_age
-    return dataset_train, dataset_validation, dataset_test, args
+    return dataset_train, dataset_val, dataset_test, args
 
 
 # ------------------- Cam-CAN Dataset ---------------------
@@ -71,6 +74,9 @@ def build_dataset_camcan(args):
     train_images = images[train_index].astype(np.float32)
     validation_images = images[validation_index].astype(np.float32)
     test_images = images[test_index].astype(np.float32)
+    input_shape = train_images.shape[1:]
+    del images
+
     # add dimension for labels: (32,) -> (32, 1)
     train_labels = np.expand_dims(df.loc[train_index, 'Age'].values, axis=1).astype(np.float32)
     validation_labels = np.expand_dims(df.loc[validation_index, 'Age'].values, axis=1).astype(np.float32)
@@ -80,22 +86,31 @@ def build_dataset_camcan(args):
                 f'testing images shape: {test_images.shape}, training labels shape: {train_labels.shape}, '
                 f'validation labels shape: {validation_labels.shape}, testing labels shape: {test_labels.shape}')
 
-    # Huggingface Dataset for train set.
-    dataset_train = TrainDataset(images=train_images, labels=train_labels)
-    dataset_train = transform_to_huggingface_dataset(pt_dataset=dataset_train)
-    dataset_train.set_format(type='torch', columns=['image', 'label'])
-    # Huggingface Dataset for validation set
-    dataset_validation = ValidationDataset(images=validation_images, labels=validation_labels)
-    dataset_validation = transform_to_huggingface_dataset(pt_dataset=dataset_validation)
-    dataset_validation.set_format(type='torch', columns=['image', 'label'])
-    # Huggingface Dataset for test set
-    dataset_test = TestDataset(images=test_images, labels=test_labels)
-    dataset_test = transform_to_huggingface_dataset(pt_dataset=dataset_test)
-    dataset_test.set_format(type='torch', columns=['image', 'label'])
+    # train dataset
+    dataset_train = TrainDataset(images=train_images, labels=train_labels, 
+        transform=transforms.Compose([ToTensor_MRI()]), medical_augment=medical_augmentation_pt)
+    if args.pipeline == 'hf':
+        dataset_train = transform_to_huggingface_dataset(pt_dataset=dataset_train)
+    del train_images, train_labels
 
-    return dataset_train, dataset_validation, dataset_test, lim, train_images.shape[1:], median_age
+    # val dataset
+    dataset_val = ValidationDataset(images=validation_images, labels=validation_labels, 
+        transform=transforms.Compose([ToTensor_MRI()]))
+    if args.pipeline == 'hf':
+        dataset_val = transform_to_huggingface_dataset(pt_dataset=dataset_val)
+    del validation_images, validation_labels
+
+    # test dataset
+    dataset_test = TestDataset(images=test_images, labels=test_labels, 
+        transform=transforms.Compose([ToTensor_MRI()]))
+    if args.pipeline == 'hf':
+        dataset_test = transform_to_huggingface_dataset(pt_dataset=dataset_test)
+    del test_images, test_labels
+
+    return dataset_train, dataset_val, dataset_test, lim, input_shape, median_age
 
 
+# ------------------- Pytorch dataset 2 Huggingface dataset ---------------------
 def transform_to_huggingface_dataset(pt_dataset):
     huggingface_dataset = Dataset.from_generator(gen, gen_kwargs={"pt_dataset": pt_dataset})
     return huggingface_dataset
