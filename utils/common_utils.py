@@ -8,13 +8,6 @@ logger = logging.getLogger(__name__)
 results_folder = 'model_ckpt_results'
 
 
-class ToTensor_MRI(object):
-    """Convert ndarrays in sample to Tensors for MRI"""
-    def __call__(self, sample):
-        image, label = sample[0], sample[1]
-        return torch.from_numpy(image), torch.from_numpy(label)
-
-
 # ------------------- Pytorch Dataset ---------------------
 class TrainDataset(torch.utils.data.Dataset):
     """
@@ -84,6 +77,13 @@ class TestDataset(torch.utils.data.Dataset):
         if self.transform:
             image, label = self.transform([image, label])
         return {'image': image, 'label': label}
+
+
+class ToTensor_MRI(object):
+    """Convert ndarrays in sample to Tensors for MRI"""
+    def __call__(self, sample):
+        image, label = sample[0], sample[1]
+        return torch.from_numpy(image), torch.from_numpy(label)
 
 
 # ------------------- Run Manager for no Trainer training ---------------------
@@ -213,8 +213,8 @@ def update_args(args):
         args.save_best_start_epoch = 1
         args.comment = 'test_run'
         # dataset
-        # args.val_test_size = 0.8
-        # args.test_size = 0.5
+        args.val_test_size = 0.8
+        args.test_size = 0.5
 
     args.out_dir = results_folder
     args.model_name_no_trainer = args.model+ f'-pt-{args.comment}' 
